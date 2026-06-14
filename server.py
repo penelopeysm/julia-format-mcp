@@ -390,6 +390,126 @@ async def julia_list_sessions() -> str:
     return "Active Julia sessions:\n" + "\n".join(lines)
 
 
+# The specific environment in which the local copy of JuliaFormatter is dev'd
+# into.
+_formatter_env_dir: str | None = None
+# The path to the local checkout of JuliaFormatter.
+_formatter_path: str | None = None
+
+
+def _cleanup_formatter_env():
+    if _formatter_env_dir and os.path.isdir(_formatter_env_dir):
+        shutil.rmtree(_formatter_env_dir, ignore_errors=True)
+
+
+atexit.register(_cleanup_formatter_env)
+
+
+@mcp.tool()
+async def julia_format(
+    input: str,
+    expected: str | None = None,
+    style: str | None = None,
+    options: str | None = None,
+    formatter_path: str | None = None,
+) -> str:
+    """Format Julia source code with JuliaFormatter and display the result.
+
+    Maintains a dedicated Julia session with JuliaFormatter dev'd from a local
+    checkout. Code changes to the formatter are picked up via Revise.jl.
+
+    Formats the input and pretty-prints both the original and formatted code.
+    If `expected` is also given, additionally verifies that formatting produces
+    the expected output and is idempotent (via JuliaFormatter.Internal.test_format).
+
+    Args:
+        input: Julia source code to format.
+        expected: If given, assert that formatting produces exactly this output.
+        style: Style name, e.g. "YASStyle" or "BlueStyle". Omit for DefaultStyle.
+        options: Extra keyword args as Julia syntax, e.g. "indent = 4, margin = 80".
+        formatter_path: Path to JuliaFormatter checkout. Required on first call.
+    """
+    global _formatter_env_dir, _formatter_path
+
+    need_setup = _formatter_env_dir is None
+    if formatter_path and formatter_path != _formatter_path:
+        if _formatter_env_dir:
+            await manager.restart(_formatter_env_dir)
+            _formatter_env_dir = None
+        need_setup = True
+
+    if need_setup:
+        if not formatter_path:
+            return (
+                "Error: formatter_path is required on first call "
+                "(path to your local JuliaFormatter checkout)"
+            )
+        env_dir = tempfile.mkdtemp(prefix="julia-fmt-test-")
+        try:
+            session = await manager.get_or_create(env_dir)
+            path_hex = formatter_path.encode().hex()
+            await session.execute(
+                f'using Pkg; Pkg.develop(path=String(hex2bytes("{path_hex}")))',
+                timeout=None,
+            )
+            out = await session.execute("using JuliaFormatter", timeout=120.0)
+            if "ERROR" in out:
+                await manager.restart(env_dir)
+                shutil.rmtree(env_dir, ignore_errors=True)
+                return f"Failed to load JuliaFormatter:\n{out}"
+        except RuntimeError as e:
+            shutil.rmtree(env_dir, ignore_errors=True)
+            return f"Failed to set up JuliaFormatter: {e}"
+        _formatter_env_dir = env_dir
+        _formatter_path = formatter_path
+
+    input_hex = input.encode().hex()
+    style_arg = f", {style}()" if style else ""
+    opts = f"; {options}" if options else ""
+
+    if expected is not None:
+        expected_hex = expected.encode().hex()
+        julia_code = (
+            f'let input_str = String(hex2bytes("{input_hex}")),\n'
+            f'    expected_str = String(hex2bytes("{expected_hex}"))\n'
+            f'    println("\\n── Input ──")\n'
+            f'    print(input_str)\n'
+            f'    println("\\n\\n── Expected ──")\n'
+            f'    print(expected_str)\n'
+            f'    println("\\n\\n── Test ──")\n'
+            f'    JuliaFormatter.Internal.test_format(input_str, expected_str{style_arg}{opts})\n'
+            f'end'
+        )
+    else:
+        julia_code = (
+            f'let input_str = String(hex2bytes("{input_hex}"))\n'
+            f'    result = format_text(input_str{style_arg}{opts})\n'
+            f'    idem = format_text(result{style_arg}{opts}) == result\n'
+            f'    println("\\n── Input ──")\n'
+            f'    print(input_str)\n'
+            f'    println("\\n\\n── Output ──")\n'
+            f'    print(result)\n'
+            f'    println("\\n\\nIdempotent: ", idem ? "yes" : "NO")\n'
+            f'    if !idem\n'
+            f'        println("\\n\\n── Second pass ──")\n'
+            f'        print(format_text(result{style_arg}{opts}))\n'
+            f'    end\n'
+            f'end'
+        )
+
+    try:
+        session = await manager.get_or_create(_formatter_env_dir)
+        output = await session.execute(julia_code, timeout=60.0)
+        return output if output else "(no output — test passed)"
+    except RuntimeError as e:
+        key = manager._key(_formatter_env_dir)
+        if key in manager._sessions and not manager._sessions[key].is_alive():
+            del manager._sessions[key]
+            _formatter_env_dir = None
+            _formatter_path = None
+        return f"Error: {e}"
+
+
 def main():
     global manager
     julia_args = tuple(sys.argv[1:]) if len(sys.argv) > 1 else DEFAULT_JULIA_ARGS
